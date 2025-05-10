@@ -9,7 +9,7 @@
             "type": "cppvsdbg",
             "request": "launch",
             "program": "${workspaceFolder}/target/debug/p-code.exe",
-            "args": [">", "dump.lst"],
+            "args": ["test_data/TEST.CODE", ">", "dump.lst"],
             "cwd": "${workspaceRoot}",
             "internalConsoleOptions": "openOnSessionStart",
             "logging": {

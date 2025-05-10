@@ -230,7 +230,9 @@ fn dump_segment(codefile: &[u8], info: &SegmentInfo) -> Result<()> {
 }
 
 fn main() {
-    let mut f = File::open("test_data/STARTUP.CODE").unwrap();
+    let args: Vec<String> = std::env::args().collect();
+
+    let mut f = File::open(&args[1]).unwrap();
     let mut codefile = Vec::new();
     f.read_to_end(&mut codefile).unwrap();
 
