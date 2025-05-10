@@ -1,7 +1,7 @@
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::{
     fs::File,
-    io::{Error, ErrorKind, Read},
+    io::{Error, ErrorKind, Read}
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,24 +108,27 @@ fn parse_segment_dictionary(mut codefile: &[u8]) -> std::io::Result<Vec<SegmentI
 struct PCodeReader<'a> {
     segment: &'a [u8],
     cursor: usize,
+    jtab: usize,
 }
 
 impl<'a> PCodeReader<'a> {
-    fn new(segment: &'a [u8], ic: usize) -> Self {
+    fn new(segment: &'a [u8], enter: usize, jtab: usize) -> Self {
         Self {
             segment,
-            cursor: ic,
+            cursor: enter,
+            jtab,
         }
-    }
-
-    fn skip(&mut self, len: usize) {
-        self.cursor += len;
     }
 
     fn align_to_word(&mut self) {
         if self.cursor & 1 != 0 {
             self.cursor += 1;
         }
+    }
+
+    fn read_jump_table(&self, sb: i8) -> usize {
+        let i = self.jtab.checked_add_signed(sb.into()).unwrap();
+        i - (&self.segment[i..]).read_u16::<LittleEndian>().unwrap() as usize
     }
 }
 
@@ -169,11 +172,16 @@ fn parse_ldc_params(code: &mut PCodeReader) -> std::io::Result<String> {
     Ok(if n > 0 {
         code.align_to_word();
 
-        for _ in 0..n {
-            code.read_u16::<LittleEndian>()?;
-        }
+        let mut data = vec![0u16; n.into()];
+        code.read_u16_into::<LittleEndian>(&mut data)?;
 
-        format!("{}, <data>", n)
+        let data = data
+            .iter()
+            .map(|w| format!("{:04x}h", w))
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        format!("{}, {}", n, data)
     } else {
         "0".to_string()
     })
@@ -182,7 +190,7 @@ fn parse_ldc_params(code: &mut PCodeReader) -> std::io::Result<String> {
 fn parse_lsa_params(code: &mut PCodeReader) -> std::io::Result<String> {
     let n = parse_param_ub(code)?;
     Ok(if n > 0 {
-        format!("{}, \"{}\"", n, read_string(code, n.into())?)
+        format!("{}, `{}`", n, read_string(code, n.into())?)
     } else {
         "0".to_string()
     })
@@ -191,11 +199,16 @@ fn parse_lsa_params(code: &mut PCodeReader) -> std::io::Result<String> {
 fn parse_lpa_params(code: &mut PCodeReader) -> std::io::Result<String> {
     let n = parse_param_ub(code)?;
     Ok(if n > 0 {
-        for _ in 0..n {
-            code.read_u8()?;
-        }
+        let mut data = vec![0u8; n.into()];
+        code.read_exact(&mut data)?;
 
-        format!("{}, <data>", n)
+        let data = data
+            .iter()
+            .map(|w| format!("{:04x}h", w))
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        format!("{}, {}", n, data)
     } else {
         "0".to_string()
     })
@@ -205,13 +218,35 @@ fn parse_xjp_params(code: &mut PCodeReader) -> std::io::Result<String> {
     code.align_to_word();
     let w1 = parse_param_w(code)?;
     let w2 = parse_param_w(code)?;
-    code.skip((w2 - w1 + 1) as usize * 2);
+
+    let mut cases = vec![0i16; (w2 - w1 + 1) as usize * 2];
+    code.read_i16_into::<LittleEndian>(&mut cases)?;
+
     let w3 = parse_param_w(code)?;
 
-    Ok(format!("{}, {}, <case table>, {}", w1, w2, w3))
+    let cases = cases
+        .iter()
+        .map(|w| format!("{:04x}h", w))
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    Ok(format!("{}, {}, {}, {:x}h", w1, w2, cases, w3))
+}
+
+fn parse_jump_param(code: &mut PCodeReader, ipc: usize) -> std::io::Result<String> {
+    Ok(match parse_param_sb(code)? {
+        0 => "0 ; NOP".to_string(),
+        off if off < 0 => format!(
+            "{:x}h ; {:04x} (thru jump table)",
+            off,
+            code.read_jump_table(off)
+        ),
+        off => format!("{:x}h ; {:04x}", off, ipc + off as usize),
+    })
 }
 
 fn dump_instruction(code: &mut PCodeReader) -> std::io::Result<()> {
+    let pos = code.cursor;
     match code.read_u8()? {
         159 => println!("LDCN"),
         199 => println!("LDCI {}", parse_param_w(code)?),
@@ -329,8 +364,8 @@ fn dump_instruction(code: &mut PCodeReader) -> std::io::Result<()> {
         214 => println!("XIT"),
         215 => println!("NOP"),
         213 => println!("BPT {}", parse_param_b(code)?),
-        185 => println!("UJP {}", parse_param_sb(code)?),
-        161 => println!("FJP {}", parse_param_sb(code)?),
+        185 => println!("UJP {}", parse_jump_param(code, pos)?),
+        161 => println!("FJP {}", parse_jump_param(code, pos)?),
         172 => println!("XJP {}", parse_xjp_params(code)?),
         206 => println!("CLP {}", parse_param_ub(code)?),
         207 => println!("CGP {}", parse_param_ub(code)?),
@@ -354,10 +389,10 @@ fn dump_instruction(code: &mut PCodeReader) -> std::io::Result<()> {
             35 => println!("POT"),
             x => println!("CSP {}", x),
         },
-        x @ 216..232 => println!("SLDL_{}", x - 215),
-        x @ 232..248 => println!("SLDO_{}", x - 231),
-        x @ 248..=255 => println!("SIND_{}", x - 248),
-        0..128 => println!("SLDC"),
+        x @ 216..232 => println!("SLDL {}", x - 215),
+        x @ 232..248 => println!("SLDO {}", x - 231),
+        x @ 248..=255 => println!("SIND {}", x - 248),
+        x @ 0..128 => println!("SLDC {}", x),
         x => panic!("Unknown opcode: {}", x),
     }
     Ok(())
@@ -365,33 +400,46 @@ fn dump_instruction(code: &mut PCodeReader) -> std::io::Result<()> {
 
 fn dump_p_code(code: &mut PCodeReader, exit_at: usize) {
     while code.cursor <= exit_at {
+        print!("{:04x}\t", code.cursor);
         dump_instruction(code).unwrap()
     }
 }
 
 fn dump_segment(codefile: &[u8], info: &SegmentInfo) -> std::io::Result<()> {
+    println!("; Code Segment \"{}\" (Num: {})", info.name, info.num);
+    println!(
+        ";   Code Addr: {} ({:x}h)",
+        info.code_addr,
+        (info.code_addr as usize) * 512
+    );
+    println!(";   Code Len: {} bytes", info.code_len);
+    println!(";   Segment Kind: {:?}", info.kind);
+    println!(";   Machine Type: {:?}", info.machine_type);
+    println!(";   Version: {}", info.version);
+
+    if info.machine_type != MachineType::PCodeAppleII || info.kind != SegmentKind::Linked {
+        println!();
+        return Ok(());
+    }
+
     let start: usize = (info.code_addr as usize) * 512;
     let len: usize = info.code_len.into();
     let block = &codefile[start..(start + len)];
 
-    let procedure_count = block[len - 1] as usize;
-    let segment_num = block[len - 2];
+    let proc_count = block[len - 1] as usize;
+    // TODO: let segment_num = block[len - 2];
 
-    println!(
-        "Segment {} ({}) has {} procedures",
-        info.name, segment_num, procedure_count
-    );
+    println!(";   Number of Procedures: {}", proc_count);
+    println!();
 
-    if info.machine_type != MachineType::PCodeAppleII {
-        return Ok(());
-    }
-
-    for i in 1..procedure_count + 1 {
+    for i in 1..proc_count + 1 {
         let pointer_position = len - 2 - i * 2;
         let pointer = (&block[pointer_position..]).read_u16::<LittleEndian>()?;
 
-        let proc_end = pointer_position - (pointer as usize) + 2;
-        let mut footer = &block[proc_end - 10..proc_end];
+        let jtab = pointer_position - (pointer as usize);
+        let footer_end = jtab + 2;
+        let footer_start = footer_end - 10;
+        let mut footer = &block[footer_start..footer_end];
 
         let data_size = footer.read_u16::<LittleEndian>()?;
         let param_size = footer.read_u16::<LittleEndian>()?;
@@ -400,15 +448,33 @@ fn dump_segment(codefile: &[u8], info: &SegmentInfo) -> std::io::Result<()> {
         let proc_num = footer.read_u8()?;
         let lex = footer.read_u8()?;
 
-        println!(
-            "{}_{} DATASIZE: {} PARAMSIZE: {} LEX: {} ENTERIC: {} EXITIC: {}",
-            info.name, proc_num, data_size, param_size, lex, enter_ic, exit_ic
-        );
+        let enter_addr = footer_end - 4 - enter_ic as usize;
+        let exit_addr = footer_end - 6 - exit_ic as usize;
 
-        dump_p_code(
-            &mut PCodeReader::new(block, proc_end - 4 - enter_ic as usize),
-            proc_end - 6 - exit_ic as usize,
-        );
+        println!("; Procedure {}_{}", info.name, proc_num);
+        println!(";   Lexical Level: {}", lex);
+        println!(";   Data Size: {} bytes", data_size);
+        println!(";   Param Size: {} bytes", param_size);
+        println!(";   Enter At: {:04x}h", enter_addr);
+        println!(";   Exit At: {:04x}h", exit_addr);
+        println!();
+
+        let mut reader = PCodeReader::new(block, enter_addr, jtab);
+        dump_p_code(&mut reader, exit_addr);
+        println!();
+
+        if reader.cursor < footer_start {
+            println!("; Jump table for {}_{}", info.name, proc_num);
+            println!();
+
+            while reader.cursor < footer_start {
+                let pos = reader.cursor;
+                let offset = reader.read_i16::<LittleEndian>()?;
+                println!("{:04x}\t{:04x}h", pos, offset);
+            }
+
+            println!();
+        }
     }
 
     Ok(())
@@ -420,7 +486,6 @@ fn main() {
     f.read_to_end(&mut codefile).unwrap();
 
     let segment_info = parse_segment_dictionary(&codefile).unwrap();
-    println!("{:?}", segment_info);
 
     for info in &segment_info {
         dump_segment(&codefile, info).unwrap();
